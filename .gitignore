@@ -1,0 +1,22 @@
+node_modules/
+.expo/
+dist/
+web-build/
+.env
+.env.*
+!.env.example
+
+
+__pycache__/
+evidence/
+
+# Local signing and credentials (never commit)
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.dpapi
+service-account*.json
+*service-account-key*.json

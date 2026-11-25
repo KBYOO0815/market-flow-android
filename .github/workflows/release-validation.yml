@@ -1,0 +1,42 @@
+name: Validate Market Flow release workflow
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-validation.yml'
+      - '.github/workflows/release-internal.yml'
+      - 'scripts/check-play-release.py'
+  pull_request:
+    paths:
+      - '.github/workflows/release-validation.yml'
+      - '.github/workflows/release-internal.yml'
+      - 'scripts/check-play-release.py'
+      - 'AGENTS.md'
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-structure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="1.7.7"
+          archive="actionlint_${version}_linux_amd64.tar.gz"
+          checksums="actionlint_${version}_checksums.txt"
+          url="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          curl -fsSLo "$archive" "$url/$archive"
+          curl -fsSLo "$checksums" "$url/$checksums"
+          awk -v file="$archive" '$2 == file || $2 == "*" file' "$checksums" | sha256sum -c -
+          tar -xzf "$archive" actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+      - name: Validate release workflows
+        run: actionlint .github/workflows/release-internal.yml .github/workflows/release-validation.yml
+      - name: Check Google Play verification script syntax
+        run: python3 -m py_compile scripts/check-play-release.py

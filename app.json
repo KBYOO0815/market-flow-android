@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "마켓 플로우",
+    "slug": "market-flow-app",
+    "version": "00.39",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "android": {
+      "package": "com.kbyoo0815.marketflow",
+      "versionCode": 39,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#050505"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.kbyoo0815.marketflow"
+    },
+    "extra": {
+      "releaseChannel": "prototype"
+    },
+    "icon": "./assets/icon.png"
+  }
+}
+

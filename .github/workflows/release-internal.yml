@@ -1,0 +1,205 @@
+name: Market Flow internal release
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_internal_release:
+        description: "Publish to Google Play INTERNAL track (unchecked = signed build and validation only)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-flow-internal-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: play-internal
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      version_code: ${{ steps.identity.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Confirm release is based on current main
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Read app identity
+        id: identity
+        env:
+          PUBLISH: ${{ inputs.confirm_internal_release }}
+        run: |
+          node <<'NODE'
+          const {expo} = require('./app.json');
+          const version = expo.version;
+          const code = expo.android.versionCode;
+          if (expo.android.package !== 'com.kbyoo0815.marketflow' ||
+              typeof version !== 'string' || !/^\d{2}\.\d{2}$/.test(version) ||
+              !Number.isSafeInteger(code) || code < 39 ||
+              Number(version.replace('.', '')) !== code ||
+              (process.env.PUBLISH === 'true' && code <= 39)) {
+            throw new Error('Invalid app identity or release version; publishing requires a version newer than 00.39');
+          }
+          require('fs').appendFileSync(process.env.GITHUB_OUTPUT,
+            'version=' + version + '\nversion_code=' + code + '\n');
+          console.log('Validated source version ' + version + ' (' + code + ')');
+          NODE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK components
+        run: |
+          sdk_root="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          "$sdk_root/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk_root" \
+            'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;27.1.12297006'
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
+      - name: TypeScript and tests
+        run: |
+          npm run check
+          npm run check:feeds
+      - name: Generate native Android project
+        env:
+          CI: '1'
+        run: npx expo prebuild --platform android --no-install
+      - name: Remove Expo template debug signing
+        run: |
+          sed -i '/^[[:space:]]*signingConfig signingConfigs\.debug[[:space:]]*$/d' android/app/build.gradle
+      - name: Build unsigned Android App Bundle
+        working-directory: android
+        run: ./gradlew bundleRelease --no-daemon
+      - name: Confirm unsigned bundle and sign with existing upload key
+        env:
+          MARKET_FLOW_UPLOAD_KEYSTORE_B64: ${{ secrets.MARKET_FLOW_UPLOAD_KEYSTORE_B64 }}
+          MARKET_FLOW_UPLOAD_STORE_PASSWORD: ${{ secrets.MARKET_FLOW_UPLOAD_STORE_PASSWORD }}
+          MARKET_FLOW_UPLOAD_KEY_PASSWORD: ${{ secrets.MARKET_FLOW_UPLOAD_KEY_PASSWORD }}
+          MARKET_FLOW_UPLOAD_CERT_SHA256: ${{ secrets.MARKET_FLOW_UPLOAD_CERT_SHA256 }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          test -n "$MARKET_FLOW_UPLOAD_KEYSTORE_B64"
+          test -n "$MARKET_FLOW_UPLOAD_STORE_PASSWORD"
+          test -n "$MARKET_FLOW_UPLOAD_KEY_PASSWORD"
+          expected=$(printf '%s' "$MARKET_FLOW_UPLOAD_CERT_SHA256" | tr -d ':[:space:]')
+          [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ ]]
+          aab=android/app/build/outputs/bundle/release/app-release.aab
+          test -s "$aab"
+          unzip -tq "$aab"
+          entries=$(unzip -Z1 "$aab")
+          grep -Fxq 'base/assets/index.android.bundle' <<< "$entries"
+          if grep -Eiq '^META-INF/[^/]+\.(RSA|DSA|EC|SF)$' <<< "$entries"; then
+            echo 'Refusing to sign a bundle that already has a signature'
+            exit 1
+          fi
+          umask 077
+          key_path=$(mktemp "$RUNNER_TEMP/market-flow-upload.XXXXXX")
+          trap 'rm -f "$key_path"' EXIT
+          printf '%s' "$MARKET_FLOW_UPLOAD_KEYSTORE_B64" | base64 --decode > "$key_path"
+          cert=$(keytool -list -v -storetype PKCS12 -keystore "$key_path" \
+            -storepass:env MARKET_FLOW_UPLOAD_STORE_PASSWORD -alias market-flow-upload)
+          actual=$(sed -n 's/^[[:space:]]*SHA256: //p' <<< "$cert" | head -n 1 | tr -d ':')
+          test "${actual^^}" = "${expected^^}"
+          mkdir -p release
+          jarsigner -keystore "$key_path" -storetype PKCS12 \
+            -storepass:env MARKET_FLOW_UPLOAD_STORE_PASSWORD \
+            -keypass:env MARKET_FLOW_UPLOAD_KEY_PASSWORD \
+            -signedjar release/app-release.aab "$aab" market-flow-upload
+      - name: Validate signed AAB and app identity
+        env:
+          BUNDLETOOL_VERSION: '1.18.3'
+          MARKET_FLOW_UPLOAD_CERT_SHA256: ${{ secrets.MARKET_FLOW_UPLOAD_CERT_SHA256 }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.version }}
+          EXPECTED_VERSION_CODE: ${{ steps.identity.outputs.version_code }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          aab=release/app-release.aab
+          tool="$RUNNER_TEMP/bundletool.jar"
+          test -s "$aab"
+          curl --fail --silent --show-error --location \
+            "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" \
+            --output "$tool"
+          printf '%s  %s\n' a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29 "$tool" | sha256sum -c -
+          java -jar "$tool" validate --bundle="$aab"
+          java -jar "$tool" dump manifest --bundle="$aab" > "$RUNNER_TEMP/aab-manifest.xml"
+          python3 - "$RUNNER_TEMP/aab-manifest.xml" <<'PY'
+          import os, sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          ns = '{http://schemas.android.com/apk/res/android}'
+          assert root.attrib['package'] == 'com.kbyoo0815.marketflow'
+          assert root.attrib[ns+'versionName'] == os.environ['EXPECTED_VERSION']
+          assert root.attrib[ns+'versionCode'] == os.environ['EXPECTED_VERSION_CODE']
+          assert int(root.find('uses-sdk').attrib[ns+'targetSdkVersion']) >= 36
+          print('AAB package, version and target SDK validated')
+          PY
+          verified=$(jarsigner -verify "$aab")
+          grep -Fq 'jar verified.' <<< "$verified"
+          cert=$(keytool -printcert -jarfile "$aab")
+          actual=$(sed -n 's/^[[:space:]]*SHA256: //p' <<< "$cert" | head -n 1 | tr -d ':')
+          expected=$(printf '%s' "$MARKET_FLOW_UPLOAD_CERT_SHA256" | tr -d ':[:space:]')
+          test "${actual^^}" = "${expected^^}"
+          sha256sum "$aab"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: market-flow-internal-aab
+          path: release/app-release.aab
+          if-no-files-found: error
+
+  publish-internal:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && inputs.confirm_internal_release == true
+    runs-on: ubuntu-latest
+    environment: play-internal
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Confirm approved source is still current main
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          name: market-flow-internal-aab
+          path: release
+      - name: Install Google Play API client
+        run: |
+          python3 -m venv "$RUNNER_TEMP/play-api"
+          "$RUNNER_TEMP/play-api/bin/pip" install 'google-auth==2.40.3' 'requests==2.32.5'
+      - name: Check existing Play version codes
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          EXPECTED_VERSION_CODE: ${{ needs.verify.outputs.version_code }}
+        run: '"$RUNNER_TEMP/play-api/bin/python" scripts/check-play-release.py before'
+      - name: Upload to Google Play internal testing
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.kbyoo0815.marketflow
+          releaseFiles: release/app-release.aab
+          releaseName: ${{ needs.verify.outputs.version }} Internal Test
+          track: internal
+          status: completed
+      - name: Confirm Google Play internal release
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          EXPECTED_VERSION_CODE: ${{ needs.verify.outputs.version_code }}
+        run: '"$RUNNER_TEMP/play-api/bin/python" scripts/check-play-release.py after'
