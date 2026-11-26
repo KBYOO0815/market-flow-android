@@ -16,8 +16,22 @@ const daily={
         sections:[
           {id:'indices',title:'주요 지수',kind:'metrics',items:[{label:'S&P 500',value:7175.83,changePct:-2,note:'11/19 종가'}]},
           {id:'drivers',title:'시장 흐름',kind:'bullets',items:['AI·반도체 약세']},
-          {id:'watch',title:'주의',kind:'text',text:'정규장 개장 전'}
+          {id:'watch',title:'주의',kind:'text',text:'정규장 개장 전'},
+          {id:'bad-section',title:'오류',kind:'chart',data:{}}
         ]}
+    },
+    '23:20':{
+      asOf:'2026-11-20T23:19:45+09:00',publishedAt:'2026-11-20T23:21:00+09:00',sources:[],
+      content:[
+        {type:'text',text:'제목 없이 표시되는 설명'},
+        {type:'metric',title:'주요 지표',items:[{label:'KOSPI',value:5123.45,changePct:1.25,note:'종가'}]},
+        {type:'list',title:'관찰 항목',items:['반도체 강세','환율 안정']},
+        {type:'table',title:'시장 비교',columns:['시장','등락률'],rows:[['KOSPI',1.25],['KOSDAQ',-0.4]]},
+        {type:'link',label:'원문 출처',url:'https://example.com/source'},
+        {type:'future-type',title:'지원하지 않는 항목'},
+        {type:'metric',title:'손상된 지표',items:[{value:{unexpected:true}}]},
+        {type:'list',title:'부분 손상 목록',items:['표시 항목',null,3]}
+      ]
     }
   }
 };
@@ -26,7 +40,10 @@ const response = {
   days: [daily],
   navigation: {
     previous: [],
-    today: [{date: daily.date, slot: '23:10', state: 'published'}],
+    today: [
+      {date: daily.date, slot: '23:10', state: 'published'},
+      {date: daily.date, slot: '23:20', state: 'published'}
+    ],
     next: [{date: '2026-11-23', slot: '06:10', state: 'scheduled'}],
   },
 };
@@ -47,7 +64,35 @@ mod._compile(ts.transpileModule(fs.readFileSync('src/marketStatus.ts','utf8'),{
   assert.equal(feed.navigation.next[0].state,'scheduled');
   const e=feed.days[0].editions['23:10'];
   assert.equal(e.display.headline,'미국 프리마켓 약세');
-  assert.deepEqual(e.display.sections.map(x=>x.kind),['metrics','bullets','text']);
-  assert.equal(e.display.sections[0].items[0].value,7175.83);
-  console.log('PASS: market-status parser preserves server-driven display sections');
+  assert.deepEqual(e.content.map(x=>x.type),['metric','list','text']);
+  assert.equal(e.content[0].items[0].value,7175.83);
+  assert.equal(e.contentWarnings,1);
+  const dynamic=feed.days[0].editions['23:20'];
+  assert.deepEqual(dynamic.content.map(x=>x.type),['text','metric','list','table','link','list']);
+  assert.equal(dynamic.content[0].title,undefined);
+  assert.equal(dynamic.content[0].text,'제목 없이 표시되는 설명');
+  assert.equal(dynamic.content[3].rows[1][0],'KOSDAQ');
+  assert.equal(dynamic.content[4].url,'https://example.com/source');
+  assert.equal(dynamic.content[5].items.length,1);
+  assert.equal(dynamic.contentWarnings,2);
+  assert.equal(feed.days[0].editions['23:20'].slot,'23:20');
+  const revised=JSON.parse(JSON.stringify(response));
+  const revisedItems=revised.days[0].editions['23:20'].content;
+  revisedItems.splice(2,1);
+  revisedItems.unshift({type:'text',title:'추가된 첫 항목',text:'새 분석'});
+  revised.navigation.next=[];
+  global.fetch=async()=>({ok:true,json:async()=>revised});
+  const refreshed=await mod.exports.fetchMarketStatus();
+  assert.deepEqual(refreshed.days[0].editions['23:20'].content.map(x=>x.title||x.type),[
+    '추가된 첫 항목','text','주요 지표','시장 비교','link','부분 손상 목록'
+  ]);
+  assert.deepEqual(refreshed.navigation.next,[]);
+  const blankHeader=JSON.parse(JSON.stringify(response));
+  blankHeader.days[0].editions['23:20'].content=[{type:'table',columns:['','KOSPI',2026],rows:[['등락률',1.25,-0.4]]}];
+  global.fetch=async()=>({ok:true,json:async()=>blankHeader});
+  const table=(await mod.exports.fetchMarketStatus()).days[0].editions['23:20'].content[0];
+  assert.deepEqual(table.columns,['','KOSPI','2026']);
+  assert.deepEqual(table.rows,[['등락률',1.25,-0.4]]);
+  console.log('PASS: legacy sections, content additions/removals/order, optional titles, empty navigation and malformed items');
 })().catch(e=>{console.error(e);process.exit(1)});
+

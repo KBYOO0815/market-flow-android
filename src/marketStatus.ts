@@ -9,11 +9,17 @@ export type MarketDisplaySection =
   | {id:string;title:string;kind:'bullets';items:string[]}
   | {id:string;title:string;kind:'text';text:string};
 export type MarketDisplay = {
-  headline: string;
-  badges: string[];
-  observedAt: string;
-  sections: MarketDisplaySection[];
+  headline?: string;
+  badges?: string[];
+  observedAt?: string;
+  sections?: MarketDisplaySection[];
 };
+export type MarketContentItem =
+  | {type:'text';title?:string;text:string}
+  | {type:'metric';title?:string;items:MarketDisplayMetric[]}
+  | {type:'list';title?:string;items:string[]}
+  | {type:'table';title?:string;columns:string[];rows:(string|number|null)[][]}
+  | {type:'link';title?:string;label:string;url:string;sourceName?:string;checkedAt?:string};
 export type MarketStatusEdition = {
   date: string; slot: string; scheduledFor: string; asOf: string; publishedAt: string;
   sessionStatus: string; scope: 'US_KR' | 'KR' | 'US';
@@ -21,6 +27,8 @@ export type MarketStatusEdition = {
   highlights: string[]; sources: {name:string;url:string;checkedAt:string}[];
   status: {collection:'success'|'partial';validation:'success';publication:'success'};
   display?: MarketDisplay;
+  content: MarketContentItem[];
+  contentWarnings?: number;
 };
 export type MarketRegion = {
   summary:string;observedAt:string;
@@ -50,39 +58,129 @@ const renderRegion=(x:unknown): x is MarketRegion => isObject(x) &&
   (x.themes === undefined || Array.isArray(x.themes) && x.themes.every((v:unknown)=>typeof v==='string')) &&
   (x.notes === undefined || Array.isArray(x.notes) && x.notes.every((v:unknown)=>typeof v==='string'));
 
-const renderDisplay=(x:unknown): x is MarketDisplay => {
-  if(!isObject(x) || typeof x.headline!=='string' || !x.headline.trim() ||
-    typeof x.observedAt!=='string' || !Array.isArray(x.badges) ||
-    !x.badges.every((v:unknown)=>typeof v==='string') || !Array.isArray(x.sections)) return false;
-  return x.sections.every((section:unknown)=>{
-    if(!isObject(section) || typeof section.id!=='string' || typeof section.title!=='string' ||
-      !['metrics','bullets','text'].includes(section.kind)) return false;
-    if(section.kind==='text') return typeof section.text==='string' && !!section.text.trim();
-    if(!Array.isArray(section.items) || !section.items.length) return false;
-    if(section.kind==='bullets') return section.items.every((v:unknown)=>typeof v==='string' && !!v.trim());
-    return section.items.every((v:unknown)=>isObject(v) && typeof v.label==='string' &&
-      (v.value===null || typeof v.value==='number' || typeof v.value==='string') &&
-      (v.changePct===undefined || v.changePct===null || typeof v.changePct==='number') &&
-      (v.note===undefined || typeof v.note==='string'));
-  });
+const nonEmptyString = (value: unknown): value is string => typeof value === 'string' && !!value.trim();
+const optionalTitle = (value: unknown): string | undefined => nonEmptyString(value) ? value : undefined;
+const metric = (value: unknown): MarketDisplayMetric | null => {
+  if (!isObject(value) || typeof value.label !== 'string' ||
+      !(value.value === null || typeof value.value === 'string' || typeof value.value === 'number') ||
+      (value.changePct !== undefined && value.changePct !== null && typeof value.changePct !== 'number') ||
+      (value.note !== undefined && typeof value.note !== 'string')) return null;
+  return {label:value.label,value:value.value,changePct:value.changePct,note:value.note};
 };
 
-function parseEdition(value: unknown): MarketStatusEdition | null {
-  if (!isObject(value) || typeof value.asOf !== 'string' ||
-      !Array.isArray(value.sources) ||
-      !value.sources.every((source: unknown) => isObject(source) &&
-        typeof source.name === 'string' && typeof source.url === 'string')) return null;
-
-  // Unified editions render the publisher's display model. Their raw market
-  // data can have different shapes and is used only by legacy cards.
-  if (value.display !== undefined) {
-    return renderDisplay(value.display) ? value as MarketStatusEdition : null;
+function parseContentItem(value: unknown): MarketContentItem | null {
+  if (!isObject(value)) return null;
+  const type = value.type ?? value.kind ?? value.format;
+  const title = optionalTitle(value.title);
+  if (type === 'text') {
+    const text = value.text ?? value.content ?? value.value;
+    return nonEmptyString(text) ? {type,title,text} : null;
   }
-  if (!Array.isArray(value.highlights) ||
-      !value.highlights.every((highlight: unknown) => typeof highlight === 'string') ||
-      (value.kr !== null && !renderRegion(value.kr)) ||
-      (value.us !== null && !renderRegion(value.us))) return null;
-  return value as MarketStatusEdition;
+  if (type === 'metric') {
+    const metricValue = isObject(value.value) ? value.value : value;
+    const rows = Array.isArray(value.items) ? value.items.map(metric).filter((x): x is MarketDisplayMetric => x !== null)
+      : [metric(metricValue)].filter((x): x is MarketDisplayMetric => x !== null);
+    return rows.length ? {type,title,items:rows} : null;
+  }
+  if (type === 'list') {
+    const rows = value.items ?? value.list ?? value.content;
+    if (!Array.isArray(rows)) return null;
+    const items = rows.filter(nonEmptyString);
+    return items.length ? {type,title,items} : null;
+  }
+  if (type === 'table') {
+    const rawColumns = Array.isArray(value.columns) ? value.columns : Array.isArray(value.headers) ? value.headers : [];
+    // Blank headers keep their position so that row cells stay under the right column.
+    const columns: string[] = rawColumns.map((column: unknown) => typeof column === 'string' ? column
+      : typeof column === 'number' ? String(column)
+      : isObject(column) && typeof column.label === 'string' ? column.label : '');
+    const rawRows = Array.isArray(value.rows) ? value.rows : Array.isArray(value.data) ? value.data : [];
+    const inferred = rawRows.find(isObject);
+    const finalColumns = columns.some(nonEmptyString) ? columns : inferred ? Object.keys(inferred) : [];
+    if (!finalColumns.length) return null;
+    const rows = rawRows.map((row: unknown) => {
+      const cells = Array.isArray(row) ? row : isObject(row) ? finalColumns.map(column => row[column]) : null;
+      if (!cells) return null;
+      return finalColumns.map((_, index) => {
+        const cell = cells[index];
+        return cell === null || typeof cell === 'string' || typeof cell === 'number' ? cell : null;
+      });
+    }).filter((row: (string|number|null)[] | null): row is (string|number|null)[] => row !== null);
+    return {type,title,columns:finalColumns,rows};
+  }
+  if (type === 'link') {
+    const url = typeof value.url === 'string' ? value.url : typeof value.href === 'string' ? value.href
+      : typeof value.sourceUrl === 'string' ? value.sourceUrl : '';
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:' || !parsed.hostname || parsed.username || parsed.password) return null;
+    } catch { return null; }
+    const label = nonEmptyString(value.label) ? value.label : nonEmptyString(value.sourceName) ? value.sourceName : url;
+    return {type,title,label,url,sourceName:typeof value.sourceName === 'string' ? value.sourceName : undefined,
+      checkedAt:typeof value.checkedAt === 'string' ? value.checkedAt : undefined};
+  }
+  return null;
+}
+
+function legacyContent(display: unknown): {content:MarketContentItem[];warnings:number} {
+  if (!isObject(display) || !Array.isArray(display.sections)) return {content:[],warnings:0};
+  const content: MarketContentItem[] = [];
+  let warnings = 0;
+  for (const section of display.sections) {
+    if (!isObject(section)) { warnings++; continue; }
+    const title = optionalTitle(section.title);
+    if (section.kind === 'metrics' && Array.isArray(section.items)) {
+      const items = section.items.map(metric).filter((x): x is MarketDisplayMetric => x !== null);
+      if (items.length) content.push({type:'metric',title,items});
+      warnings += section.items.length - items.length;
+    } else if (section.kind === 'bullets' && Array.isArray(section.items)) {
+      const items = section.items.filter(nonEmptyString);
+      if (items.length) content.push({type:'list',title,items});
+      warnings += section.items.length - items.length;
+    } else if (section.kind === 'text' && nonEmptyString(section.text)) {
+      content.push({type:'text',title,text:section.text});
+    } else warnings++;
+  }
+  return {content,warnings};
+}
+
+function parseEdition(value: unknown, date: string, slot: string): MarketStatusEdition | null {
+  if (!isObject(value)) return null;
+  const rawDisplay = isObject(value.display) ? value.display : undefined;
+  const rawContent = Array.isArray(value.content) ? value.content : undefined;
+  const parsedContent = rawContent?.map(parseContentItem) ?? [];
+  const contentWarnings = rawContent ? rawContent.length - parsedContent.filter((x): x is MarketContentItem => x !== null).length : 0;
+  const normalizedContent = parsedContent.filter((x): x is MarketContentItem => x !== null);
+  const useLegacyFallback = !!rawContent?.length && !normalizedContent.length && !!rawDisplay;
+  const converted = rawContent && !useLegacyFallback
+    ? {content:normalizedContent,warnings:contentWarnings}
+    : legacyContent(rawDisplay);
+  const sources = Array.isArray(value.sources) ? value.sources.filter((source:unknown)=>isObject(source)&&
+    typeof source.name==='string'&&typeof source.url==='string').map((source:any)=>({name:source.name,url:source.url,
+      checkedAt:typeof source.checkedAt==='string'?source.checkedAt:''})) : [];
+  const asOf = typeof value.asOf === 'string' ? value.asOf : typeof value.publishedAt === 'string' ? value.publishedAt : date+'T'+slot+':00+09:00';
+  const display: MarketDisplay | undefined = rawDisplay ? {
+    headline:typeof rawDisplay.headline==='string'?rawDisplay.headline:undefined,
+    badges:Array.isArray(rawDisplay.badges)?rawDisplay.badges.filter((x:unknown):x is string=>typeof x==='string'):[],
+    observedAt:typeof rawDisplay.observedAt==='string'?rawDisplay.observedAt:undefined,
+    sections:Array.isArray(rawDisplay.sections)?rawDisplay.sections as MarketDisplaySection[]:[]
+  } : undefined;
+  const legacyValid = Array.isArray(value.highlights) &&
+    (value.kr === null || value.kr === undefined || renderRegion(value.kr)) &&
+    (value.us === null || value.us === undefined || renderRegion(value.us));
+  if (!rawContent && !rawDisplay && !legacyValid) return null;
+  const warnings = converted.warnings + (useLegacyFallback ? contentWarnings : 0);
+  return {
+    ...(value as unknown as MarketStatusEdition), date, slot,
+    scheduledFor:typeof value.scheduledFor==='string'?value.scheduledFor:date+'T'+slot+':00+09:00',
+    asOf,publishedAt:typeof value.publishedAt==='string'?value.publishedAt:'',
+    sessionStatus:typeof value.sessionStatus==='string'?value.sessionStatus:'',
+    scope:value.scope==='US_KR'||value.scope==='KR'||value.scope==='US'?value.scope:'KR',
+    us:renderRegion(value.us)?value.us:null, kr:renderRegion(value.kr)?value.kr:null,
+    highlights:Array.isArray(value.highlights)?value.highlights.filter((x:unknown):x is string=>typeof x==='string'):[],
+    sources,status:value.status&&typeof value.status==='object'?value.status:{collection:'partial',validation:'success',publication:'success'},
+    display,content:converted.content,...(warnings?{contentWarnings:warnings}:{})
+  };
 }
 
 async function readJson(url:string):Promise<unknown> {
@@ -112,9 +210,9 @@ export async function fetchMarketStatus(now=Date.now()):Promise<MarketStatusFeed
         today:Array.isArray(nav.today)?nav.today.filter(navEntry):[],
         next:Array.isArray(nav.next)?nav.next.filter(navEntry):[]
       };
-      const days:MarketStatusDay[]=unified.days.filter((d:unknown)=>isObject(d)&&typeof d.date==='string'&&isObject(d.editions)).map((d:any)=>{
+        const days:MarketStatusDay[]=unified.days.filter((d:unknown)=>isObject(d)&&typeof d.date==='string'&&isObject(d.editions)).map((d:any)=>{
         const editions:Record<string,MarketStatusEdition>={};
-        for(const [slot,v] of Object.entries(d.editions)){const parsed=parseEdition(v);if(parsed)editions[slot]=parsed;}
+          for(const [slot,v] of Object.entries(d.editions)){const parsed=parseEdition(v,d.date,slot);if(parsed)editions[slot]=parsed;}
         return {schemaVersion:1 as const,date:d.date,editions};
       });
       return {days:days.sort((a,b)=>b.date.localeCompare(a.date)),navigation};

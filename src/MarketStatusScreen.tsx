@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, AppState, FlatList, Linking, PanResponder, RefreshControl, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
-import { fetchMarketStatus, type MarketDisplayMetric, type MarketDisplaySection, type MarketStatusEdition, type MarketStatusNavigation, type MarketStatusNavigationEntry } from './marketStatus';
+import { fetchMarketStatus, type MarketContentItem, type MarketDisplayMetric, type MarketStatusEdition, type MarketStatusNavigation, type MarketStatusNavigationEntry } from './marketStatus';
 import { isNewerPublication, visibleNavigationTimeline } from './editions';
 
 const Y = '#F6DF83';
@@ -18,10 +18,10 @@ export function marketNavigationTimeline(navigation: MarketStatusNavigation, now
   return visibleNavigationTimeline(navigation, now);
 }
 
-function MetricsSection({ section }: { section: Extract<MarketDisplaySection,{kind:'metrics'}> }) {
+function MetricsSection({ title, items }: { title?: string; items: MarketDisplayMetric[] }) {
   return <View style={s.section}>
-    <Text style={s.sectionTitle}>{section.title}</Text>
-    {section.items.map((item, i) => <View key={section.id + i} style={s.metricRow}>
+    {!!title && <Text style={s.sectionTitle}>{title}</Text>}
+    {items.map((item, i) => <View key={(title || 'metric') + i} style={s.metricRow}>
       <View style={s.metricLeft}>
         <Text style={s.metricLabel}>{item.label}</Text>
         {!!item.note && <Text style={s.metricNote}>{item.note}</Text>}
@@ -34,15 +34,30 @@ function MetricsSection({ section }: { section: Extract<MarketDisplaySection,{ki
   </View>;
 }
 
-function DisplaySection({ section }: { section: MarketDisplaySection }) {
-  if(section.kind === 'metrics') return <MetricsSection section={section} />;
-  if(section.kind === 'text') return <View style={s.section}>
-    <Text style={s.sectionTitle}>{section.title}</Text>
-    <Text style={s.body}>{section.text}</Text>
+function ContentSection({ item }: { item: MarketContentItem }) {
+  if (item.type === 'metric') return <MetricsSection title={item.title} items={item.items} />;
+  if (item.type === 'text') return <View style={s.section}>
+    {!!item.title && <Text style={s.sectionTitle}>{item.title}</Text>}
+    <Text style={s.body}>{item.text}</Text>
+  </View>;
+  if (item.type === 'list') return <View style={s.section}>
+    {!!item.title && <Text style={s.sectionTitle}>{item.title}</Text>}
+    {item.items.map((value, i) => <Text key={(item.title || 'list') + i} style={s.bullet}>• {value}</Text>)}
+  </View>;
+  if (item.type === 'table') return <View style={s.section}>
+    {!!item.title && <Text style={s.sectionTitle}>{item.title}</Text>}
+    <View style={s.tableRow}>{item.columns.map((column, i) => <Text key={'h'+i} style={[s.tableCell,s.tableHeader]}>{column}</Text>)}</View>
+    {item.rows.map((row, ri) => <View key={'r'+ri} style={s.tableRow}>
+      {item.columns.map((_, ci) => <Text key={'c'+ci} style={s.tableCell}>{metricValue(row[ci] ?? null)}</Text>)}
+    </View>)}
   </View>;
   return <View style={s.section}>
-    <Text style={s.sectionTitle}>{section.title}</Text>
-    {section.items.map((item, i) => <Text key={section.id + i} style={s.bullet}>• {item}</Text>)}
+    {!!item.title && <Text style={s.sectionTitle}>{item.title}</Text>}
+    <TouchableOpacity accessibilityRole="link" accessibilityLabel={item.label + ' 원문 열기'}
+      onPress={() => void Linking.openURL(item.url).catch(() => undefined)} style={s.sourceRow}>
+      <Text style={[s.sourceName,s.link]}>{item.label} ↗</Text>
+      {!!item.checkedAt && <Text style={s.sourceTime}>{hhmm(item.checkedAt)} 확인</Text>}
+    </TouchableOpacity>
   </View>;
 }
 
@@ -194,12 +209,14 @@ export function MarketStatusScreen() {
       renderItem={({ item: e }) => <View>
         <Text style={s.meta}>관측 {hhmm(e.display?.observedAt || e.asOf)} · 발행 {hhmm(e.publishedAt)}</Text>
         {e.display ? <>
-          <Text style={s.headline}>{e.display.headline}</Text>
-          {!!e.display.badges.length && <View style={s.badges}>
+          {!!e.display.headline && <Text style={s.headline}>{e.display.headline}</Text>}
+          {!!e.display.badges?.length && <View style={s.badges}>
             {e.display.badges.map((badge,i)=><View key={i} style={s.badge}><Text style={s.badgeText}>{badge}</Text></View>)}
           </View>}
-          {e.display.sections.map(section => <DisplaySection key={section.id} section={section} />)}
-        </> : renderLegacy(e)}
+        </> : null}
+        {e.content.map((item,i)=><ContentSection key={item.type+'-'+i} item={item} />)}
+        {!!e.contentWarnings && <Text style={s.warning}>일부 시황 항목을 지원하지 않아 건너뛰었습니다. ({e.contentWarnings})</Text>}
+        {!e.display && e.content.length===0 && renderLegacy(e)}
         {!!e.sources.length && <View style={s.section}>
           <Text style={s.sectionTitle}>출처</Text>
           {e.sources.map((source, i) => <TouchableOpacity key={i} onPress={() => void Linking.openURL(source.url)} style={s.sourceRow}
@@ -244,7 +261,11 @@ const s = StyleSheet.create({
   metricChange: { color: Y, fontSize: 12, fontWeight: '700', marginTop: 2 },
   sourceRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, minHeight: 42, paddingVertical: 5 },
   sourceName: { color: '#D8D8D8', fontSize: 12, flex: 1 },
+  link: { color: Y },
   sourceTime: { color: '#666', fontSize: 10 },
+  tableRow: { flexDirection: 'row', borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#343434' },
+  tableCell: { color: '#F1F1F1', flex: 1, paddingHorizontal: 5, paddingVertical: 9, fontSize: 12 },
+  tableHeader: { color: Y, fontWeight: '700' },
   muted: { color: '#888', fontSize: 12, lineHeight: 20 },
   empty: { alignItems: 'center', marginTop: 40 },
 });
